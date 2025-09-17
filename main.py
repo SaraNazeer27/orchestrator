@@ -1,11 +1,25 @@
 import os
 import atexit
+import sys
+import uuid
+from pathlib import Path
+from typing import Annotated
 
-from langgraph.prebuilt import create_react_agent
+from langgraph.prebuilt import create_react_agent, InjectedState
 from langgraph_supervisor import create_supervisor
 from langchain.chat_models import init_chat_model
 from langchain_core.messages import convert_to_messages
 from langgraph.checkpoint.sqlite import SqliteSaver
+# from langchain_core.tools import tool, InjectedToolCallId
+from langchain_core.tools import StructuredTool, tool, InjectedToolCallId
+from langgraph.graph import MessagesState
+from langgraph.types import Command
+
+# ----------------------------
+# Paths & Checkpointer
+# ----------------------------
+BASE_DIR = Path("./md_files").resolve()
+BASE_DIR.mkdir(parents=True, exist_ok=True)
 
 # Hold onto the context manager to prevent premature finalization (which would close the DB)
 _CHECKPOINTER_CM = SqliteSaver.from_conn_string("memory.db")
@@ -14,12 +28,14 @@ CHECKPOINTER = _CHECKPOINTER_CM.__enter__()
 atexit.register(lambda: _CHECKPOINTER_CM.__exit__(None, None, None))
 
 
+# ----------------------------
+# Pretty printing helpers
+# ----------------------------
 def pretty_print_message(message, indent=False):
     pretty_message = message.pretty_repr(html=True)
     if not indent:
         print(pretty_message)
         return
-
     indented = "\n".join("\t" + c for c in pretty_message.split("\n"))
     print(indented)
 
@@ -31,37 +47,26 @@ def pretty_print_messages(update, last_message=False):
         # skip parent graph updates in the printouts
         if len(ns) == 0:
             return
-
         graph_id = ns[-1].split(":")[0]
-        print(f"Update from subgraph {graph_id}:")
-        print("\n")
+        print(f"Update from subgraph {graph_id}:\n")
         is_subgraph = True
 
     for node_name, node_update in update.items():
         update_label = f"Update from node {node_name}:"
         if is_subgraph:
             update_label = "\t" + update_label
-
-        print(update_label)
-        print("\n")
+        print(update_label, "\n")
 
         messages = convert_to_messages(node_update["messages"])
         if last_message:
             messages = messages[-1:]
-
         for m in messages:
             pretty_print_message(m, indent=is_subgraph)
         print("\n")
 
 
 def extract_messages_from_result(result):
-    """Return the list of messages from a LangGraph result in a robust way.
-
-    Handles both shapes:
-    - {"supervisor": {"messages": [...]}}
-    - {"messages": [...]}
-    Returns None if not found.
-    """
+    """Return list of messages from a LangGraph result; handles multiple shapes."""
     try:
         if isinstance(result, dict):
             sup = result.get("supervisor")
@@ -75,7 +80,7 @@ def extract_messages_from_result(result):
 
 
 def message_content(msg):
-    """Get content from a message object or dict safely."""
+    """Get content from a message or dict safely."""
     if hasattr(msg, "content"):
         return msg.content
     if isinstance(msg, dict):
@@ -83,38 +88,154 @@ def message_content(msg):
     return str(msg)
 
 
-def start_supervisor(agents: dict):
-    prompt = "You are a supervisor managing two agents:\n"
-    for agent_name, agent in agents.items():
-        prompt += f"- a {agent_name} agent. Assign {agent_name}-related tasks to this agent\n"
-    prompt += (
-        "Assign work to one agent at a time, do not call agents in parallel.\n"
-        "Do not do any work yourself."
-    )
-    supervisor = create_supervisor(
-        model=init_chat_model("openai:gpt-4.1"),
-        agents=[agent for agent in agents.values()],
-        prompt=(
-            prompt
-        ),
-        add_handoff_back_messages=True,
-        output_mode="full_history",
-    ).compile(checkpointer=CHECKPOINTER)
-    return supervisor
+# ----------------------------
+# Safe file helpers & tools
+# ----------------------------
+def _safe_path(path: str) -> Path:
+    """
+    Resolve `path` under BASE_DIR and prevent escaping (.. traversal).
+    Ensures .md extension.
+    """
+    p = (BASE_DIR / path).with_suffix(".md")
+    rp = p.resolve()
+    if BASE_DIR not in rp.parents and rp != BASE_DIR:
+        raise ValueError("Invalid path: outside allowed directory.")
+    return rp
 
 
-def create_agent(name: str, promt: str, tools: list):
-    agent = create_react_agent(
-        model="openai:gpt-4.1",
-        tools=tools,
-        prompt=(
-            promt
-        ),
-        name=name,
-    )
-    return agent
+@tool("create_md")
+def create_md(path: str, content: str, overwrite: bool = False) -> str:
+    """
+    Create a new .md file at `path` with `content`.
+    - If `overwrite` is False and file exists -> error.
+    Returns the absolute file path.
+    """
+    fp = _safe_path(path)
+    if fp.exists() and not overwrite:
+        raise FileExistsError(f"File already exists: {fp}")
+    fp.parent.mkdir(parents=True, exist_ok=True)
+    fp.write_text(content or "", encoding="utf-8")
+    return str(fp)
 
 
+@tool("read_md")
+def read_md(path: str) -> str:
+    """
+    Read and return the contents of the .md file at `path`.
+    """
+    fp = _safe_path(path)
+    if not fp.exists():
+        raise FileNotFoundError(f"Not found: {fp}")
+    return fp.read_text(encoding="utf-8")
+
+
+@tool("update_md")
+def update_md(path: str, content: str, mode: str = "overwrite") -> str:
+    """
+    Update the .md file at `path`.
+    - mode="overwrite": replace entire file with `content`
+    - mode="append":    append `content` to end (preceded by a newline if needed)
+    Returns a short status message.
+    """
+    fp = _safe_path(path)
+    if not fp.exists():
+        raise FileNotFoundError(f"Not found: {fp}")
+
+    if mode == "overwrite":
+        fp.write_text(content or "", encoding="utf-8")
+        return "overwritten"
+    elif mode == "append":
+        existing = fp.read_text(encoding="utf-8")
+        sep = "" if existing.endswith(("\n", "\r")) or not existing else "\n"
+        fp.write_text(existing + sep + (content or ""), encoding="utf-8")
+        return "appended"
+    else:
+        raise ValueError('mode must be "overwrite" or "append"')
+
+
+@tool("delete_md")
+def delete_md(path: str) -> str:
+    """
+    Delete the .md file at `path`.
+    Returns a short status message.
+    """
+    fp = _safe_path(path)
+    if not fp.exists():
+        raise FileNotFoundError(f"Not found: {fp}")
+    fp.unlink()
+    return "deleted"
+
+
+@tool("save_markdown")
+def save_markdown(filename: str, content: str) -> str:
+    """Save provided Markdown content to a .md file for download by the Business Analyst.
+
+    Args:
+        filename: Desired output filename ('.md' will be enforced; path will be sanitized).
+        content: Markdown content to write.
+
+    Behavior:
+        - Writes into the 'exports' folder under this project.
+        - Sanitizes filename to avoid path traversal.
+        - Returns the absolute path to the saved file and size info.
+    """
+    base_dir = os.path.join(os.path.dirname(__file__), "exports")
+    os.makedirs(base_dir, exist_ok=True)
+
+    safe = "".join(c for c in (filename or "document.md") if c.isalnum() or c in ("-", "_", ".", " ")).strip()
+    if not safe:
+        safe = "document.md"
+    if not safe.lower().endswith(".md"):
+        safe += ".md"
+
+    out_path = os.path.join(base_dir, safe)
+    data = content or ""
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(data)
+
+    abs_path = os.path.abspath(out_path)
+    size_bytes = len(data.encode("utf-8"))
+    return f"Saved markdown to {abs_path} ({size_bytes} bytes)."
+
+
+# ----------------------------
+# Handoff tool factory
+# ----------------------------
+def create_handoff_tool(*, agent_name: str, description: str | None = None):
+    """
+    Create a supervisor-owned tool that, when invoked, transfers control to `agent_name`
+    and forwards the full MessagesState to that agent.
+    """
+    name = f"transfer_to_{agent_name}"
+    description = description or f"Hand off to {agent_name}."
+
+    def handoff_tool(
+            state: Annotated[MessagesState, InjectedState],
+            tool_call_id: Annotated[str, InjectedToolCallId],
+    ) -> Command:
+        """Transfer control to the target agent and forward the full MessagesState.
+
+        This tool is dynamically named per agent as transfer_to_<agent_name>.
+        """
+        tool_message = {
+            "role": "tool",
+            "content": f"Successfully transferred to {agent_name}",
+            "name": name,
+            "tool_call_id": tool_call_id,
+        }
+        # Pass the full history in `update` and jump to the worker node
+        return Command(
+            goto=agent_name,  # node name of the worker agent
+            update={**state, "messages": state["messages"] + [tool_message]},
+            graph=Command.PARENT,  # run this in the parent (supervisor) graph
+        )
+
+    return StructuredTool.from_function(handoff_tool, name=name, description=description)
+
+
+# ----------------------------
+# Simple math helpers (kept from your original)
+# ----------------------------
 def add(a: float, b: float):
     """Add two numbers."""
     return a + b
@@ -130,19 +251,161 @@ def divide(a: float, b: float):
     return a / b
 
 
+# ----------------------------
+# Agent factory
+# ----------------------------
+def create_agent(name: str, prompt: str, tools: list):
+    agent = create_react_agent(
+        model="openai:gpt-4o-mini",
+        tools=tools,
+        prompt=prompt,
+        name=name,
+    )
+    return agent
+
+
+# ----------------------------
+# Supervisor factory (accepts transfer tools)
+# ----------------------------
+# def generate_supervisor(agents: dict, tools: list):
+#     # Build a helpful prompt that tells the supervisor to *use* the transfer tools
+#     prompt = "You are a supervisor that routes work to exactly one agent at a time.\n"
+#     prompt += "Use the appropriate transfer tool to hand off the full conversation to that agent.\n"
+#     prompt += "Do not do any domain work yourself.\n"
+#     prompt += "Agents available:\n"
+#     for agent_name, agent in agents.items():
+#         prompt += f"- {agent.name if hasattr(agent, 'name') else agent_name}\n"
+#     prompt += (
+#         "\nRules:\n"
+#         "- Always decide which single agent should act next.\n"
+#         "- Call the matching tool `transfer_to_<agent_name>` to hand off control.\n"
+#         "- Wait for the agent to respond before making another decision.\n"
+#     )
+#
+#     supervisor = create_supervisor(
+#         model=init_chat_model("openai:gpt-4o-mini"),
+#         agents=[agent for agent in agents.values()],
+#         prompt=prompt,
+#         tools=tools,  # supervisor gets the handoff tools
+#         add_handoff_back_messages=True,
+#         output_mode="full_history",
+#     ).compile(checkpointer=CHECKPOINTER)
+#
+#     return supervisor
+
+# ADD these imports if not already present
+from langgraph.graph import StateGraph, START, MessagesState
+
+def build_graph_with_supervisor_agent(agents: dict, handoff_tools: list):
+    """
+    Build a LangGraph that starts at a react-style supervisor node which only routes
+    by calling handoff tools (transfer_to_<agent>) to jump to worker nodes.
+    After any worker replies once, it returns to the supervisor.
+    """
+    # 1) Create a react-style supervisor agent that ONLY routes via tools
+    agent_names_for_prompt = ", ".join([a.name for a in agents.values()])
+    supervisor_prompt = (
+        "You are a supervisor that routes tasks to exactly one agent at a time.\n"
+        f"Agents available: {agent_names_for_prompt}\n"
+        "- Do not solve tasks yourself.\n"
+        "- ALWAYS call the correct tool named `transfer_to_<agent_name>` to hand off.\n"
+        "- After a worker responds, you may decide the next handoff.\n"
+    )
+
+    supervisor_agent = create_react_agent(
+        model="openai:gpt-4o-mini",
+        tools=handoff_tools,
+        prompt=supervisor_prompt,
+        name="supervisor",
+    )
+
+    # 2) Build the parent graph with supervisor + worker nodes
+    graph = StateGraph(MessagesState)
+
+    # Add supervisor node
+    graph.add_node("supervisor", supervisor_agent)
+
+    # Add worker nodes (their names MUST match the names given in create_agent(...))
+    for _key, worker in agents.items():
+        # each value is already a runnable agent from create_react_agent
+        graph.add_node(worker.name, worker)
+
+    # Start at supervisor
+    graph.add_edge(START, "supervisor")
+
+    # After any worker runs, return to supervisor
+    for _key, worker in agents.items():
+        graph.add_edge(worker.name, "supervisor")
+
+    # 3) Compile
+    return graph.compile(checkpointer=CHECKPOINTER)
+
+
+# ----------------------------
+# Interactive shell
+# ----------------------------
+def interactive_chat(supervisor, initial_thread_id: str | None = None):
+    thread_id = initial_thread_id or f"session-{uuid.uuid4().hex[:8]}"
+    print("Interactive chat mode. Type your message and press Enter.")
+    print("Commands: /help, /exit, /quit, /new, /thread")
+    print(f"Current thread_id: {thread_id}")
+    while True:
+        try:
+            user_in = input("> ").strip()
+        except EOFError:
+            print("\n[EOF] Exiting.")
+            break
+        except KeyboardInterrupt:
+            print("\n[Ctrl-C] Type /exit to quit or /help for commands.")
+            continue
+        if not user_in:
+            continue
+        if user_in.startswith("/"):
+            cmd = user_in.lower().strip()
+            if cmd in ("/exit", "/quit"):
+                print("Bye.")
+                break
+            if cmd == "/help":
+                print("Commands:")
+                print("  /help   Show this help")
+                print("  /exit   Exit the chat")
+                print("  /quit   Exit the chat")
+                print("  /new    Start a new conversation thread (new thread_id)")
+                print("  /thread Show current thread_id")
+                continue
+            if cmd == "/new":
+                thread_id = f"session-{uuid.uuid4().hex[:8]}"
+                print(f"Started new thread: {thread_id}")
+                continue
+            if cmd == "/thread":
+                print(f"Current thread_id: {thread_id}")
+                continue
+            print(f"Unknown command: {cmd}. Type /help")
+            continue
+        cfg = {"configurable": {"thread_id": thread_id}}
+        try:
+            for chunk in supervisor.stream({"messages": [{"role": "user", "content": user_in}]}, config=cfg):
+                pretty_print_messages(chunk, last_message=True)
+        except Exception as e:
+            print(f"Error during streaming: {e}")
+
+
+# ----------------------------
+# Main: define agents and supervisor with handoffs
+# ----------------------------
 def main():
     agents = {
         "ba": create_agent(
             name="business_analyst",
-            promt="""
+            prompt="""
 **Persona:**
 
 You are an expert **Senior Business Analyst** at a global software company. Your specialization is in Health Information Systems (HIS). You possess a deep understanding of clinical workflows, healthcare data management, and software development lifecycles.
- 
+
 **Context:**
 
 Our company develops and maintains a cutting-edge, cloud-native Health Information System (HIS). This system is built on a **microservices architecture**, with dozens of independent services handling specific domains (e.g., Patient Management, Scheduling, Billing, Clinical Records, etc.). Our customer base is worldwide, including major hospital networks in North America, Europe, and Asia.
- 
+
 **Core Mandates & Constraints (Non-Negotiable):**
 
 1.  **HL7 FHIR Standard:** All interoperability and data exchange specifications **must** strictly adhere to the latest version of the HL7 FHIR standard. You must identify the specific FHIR resources (e.g., `Patient`, `Observation`, `Encounter`, `MedicationRequest`) relevant to any new feature.
@@ -152,21 +415,21 @@ Our company develops and maintains a cutting-edge, cloud-native Health Informati
 3.  **Microservices Architecture:** Your analysis must identify which existing microservices are likely to be impacted by the new feature and whether any new microservices might be required.
 
 4.  **Scalability & Performance:** The solution must be designed to serve a large, global user base, so requirements should implicitly support scalability and high performance.
- 
+
 **Your Task:**
 
 When I provide you with a high-level feature request or a business problem, you will perform a complete business analysis and generate a structured requirements document. Your response **must** include the following sections, formatted exactly as shown below:
- 
+
 ---
- 
+
 ### 1. Feature Epic
 
 * **Epic Title:** A concise, descriptive title for the overall feature.
 
 * **Epic Description:** A detailed narrative explaining the feature, the problem it solves, its value proposition, and the primary business goals.
- 
+
 ---
- 
+
 ### 2. User Stories
 
 * Create a list of user stories that break down the epic into manageable chunks.
@@ -174,15 +437,15 @@ When I provide you with a high-level feature request or a business problem, you 
 * Follow the standard format: **As a** `[user role]`, **I want** `[to perform an action]`, **so that** `[I can achieve a benefit]`.
 
 * Include stories for different user roles (e.g., Doctor, Nurse, Patient, Administrator, Billing Clerk).
- 
+
 ---
- 
+
 ### 3. Acceptance Criteria
 
 * For each user story, provide detailed acceptance criteria in the **Gherkin format (Given/When/Then)**.
 
 * These criteria must be specific, measurable, and testable.
- 
+
 *Example:*
 
 * **User Story 1:** As a Doctor, I want to view a patient's latest lab results directly from their chart summary, so that I can make faster clinical decisions.
@@ -198,9 +461,9 @@ When I provide you with a high-level feature request or a business problem, you 
     * **Then** a modal window should appear displaying the 5 most recent lab result panels.
 
     * **And** each result should show the test name, value, reference range, and collection date.
- 
+
 ---
- 
+
 ### 4. Impacted Microservices
 
 * List the potential microservices that will need to be created or modified to implement this feature.
@@ -208,9 +471,9 @@ When I provide you with a high-level feature request or a business problem, you 
 * Provide a brief justification for each.
 
 * *Example: `PatientRecord Service` (to fetch chart data), `Observation Service` (to query lab results), `API Gateway` (to expose a new endpoint).*
- 
+
 ---
- 
+
 ### 5. Data & Interoperability (HL7 FHIR)
 
 * **Primary FHIR Resources:** Identify the core FHIR resources that will be used to represent the data for this feature.
@@ -218,9 +481,9 @@ When I provide you with a high-level feature request or a business problem, you 
 * **FHIR Interactions:** Specify the RESTful interactions needed (e.g., `GET Patient/[id]`, `POST Observation`, `SEARCH Encounter?patient=[id]`).
 
 * **Data Mapping:** Briefly describe how key data elements from the feature map to fields within the identified FHIR resources.
- 
+
 ---
- 
+
 ### 6. Security & Compliance Considerations
 
 * **Access Control:** Define which user roles should have access to this new feature/data.
@@ -230,27 +493,27 @@ When I provide you with a high-level feature request or a business problem, you 
 * **Auditing:** State what actions must be logged for audit purposes (e.g., who viewed the data and when).
 
 * **Compliance Checklist:** Briefly mention key HIPAA/GDPR rules that apply and how the feature design addresses them.
- 
+
 ---
- 
+
 ### 7. Assumptions & Clarifying Questions
 
 * List any assumptions you've made while creating this analysis.
 
 * Pose critical questions for the Product Owner or stakeholders to clarify ambiguities and resolve dependencies.
- 
+
 ---
- 
+
 **Initiation:**
 
 Your first response should always be: "I am ready to analyze your request. Please provide me with the high-level feature or business problem you would like me to work on."
- 
+
             """,
-            tools=[],
+            tools=[create_md, read_md, update_md, delete_md],
         ),
         "receptionist": create_agent(
-            name="math",
-            promt="""
+            name="receptionist",  # FIXED: must match the handoff goto target
+            prompt="""
             You are the IVF Clinic Receptionist agent in a multi-agent team (BA, Doctor, Nurse, Lab, Architect, UI/UX).
 Your job: turn the user's high-level ask into front-desk workflows and system requirements for an IVF EMR/portal.
 
@@ -399,15 +662,15 @@ Audience: internal system agents and engineers (not patients). Do NOT include PH
 
 Now, given the BA’s prompt, produce STRICT JSON only, adhering to the above.
             """,
-            tools=[],
+            tools=[create_md, read_md, update_md, delete_md],
         ),
         "nurse": create_agent(
             name="nurse",
-            promt="""
+            prompt="""
 You are the IVF Clinic Nurse agent in a multi-agent team (BA, Doctor, Lab, Receptionist, Architect, UI/UX).
 Your job: transform the user's high-level ask into nursing workflows and system requirements for an IVF EMR/portal.
 
-Return **STRICT JSON ONLY** (no markdown, no code fences, no extra prose). 
+Return **STRICT JSON ONLY** (no markdown, no code fences, no extra prose).
 Audience: internal system agents and engineers (not patients). Do NOT include PHI or real patient data.
 
 === Scope of responsibility (nurse) ===
@@ -432,7 +695,7 @@ Audience: internal system agents and engineers (not patients). Do NOT include PH
 - functional_requirements: string[]
 - user_stories: { as_a, i_want, so_that, acceptance_criteria[] }[]
 - data_fields: { entity, fields: [{ name, type, required }] }[]
-- fhir_mapping: 
+- fhir_mapping:
     # Either form is accepted:
     # 1) { module, fhir_resources[] }
     # 2) { entity, resource }
@@ -540,16 +803,17 @@ Audience: internal system agents and engineers (not patients). Do NOT include PH
 }
 
 Now, given the BA’s prompt, produce STRICT JSON only, adhering to the above.
+Once the PRD is finalized, save it in a markdown file using the save_markdown tool.
 """,
-            tools=[]
+            tools=[create_md, read_md, update_md, delete_md, save_markdown],
         ),
         "doctor": create_agent(
             name="doctor",
-            promt="""
+            prompt="""
 You are the IVF Clinic Doctor agent in a multi-agent product team (BA, Nurse, Lab, Receptionist, Architect, UI/UX).
 Your job: translate the user's high-level ask into clinically correct, actionable requirements for an IVF EMR/portal.
 
-Return **STRICT JSON ONLY** (no markdown, no code fences, no commentary), following the keys below. 
+Return **STRICT JSON ONLY** (no markdown, no code fences, no commentary), following the keys below.
 Audience: other system agents and engineers (not patients). Do NOT include PHI or real patient data.
 
 === Scope of responsibility (doctor) ===
@@ -569,13 +833,13 @@ Audience: other system agents and engineers (not patients). Do NOT include PHI o
 === Required top-level JSON keys (keep these; you may add more keys if useful) ===
 - role: must be "doctor"
 - clinical_protocols: string[]   # named protocols or protocol fragments
-- functional_requirements: string[] 
+- functional_requirements: string[]
 - user_stories: { as_a, i_want, so_that, acceptance_criteria[] }[]
 - data_fields: { entity, fields: [{ name, type, required }] }[]
-- fhir_mapping: 
+- fhir_mapping:
     # Either form is accepted (use both where helpful):
-    # 1) { module, fhir_resources[] } 
-    # 2) { entity, resource } 
+    # 1) { module, fhir_resources[] }
+    # 2) { entity, resource }
 - risks: string[]
 - assumptions: string[]                 # optional but encouraged
 - dependencies: string[]                # optional (e.g., formulary, LIS)
@@ -664,11 +928,11 @@ Audience: other system agents and engineers (not patients). Do NOT include PHI o
 
 Now, given the user's question from BA, produce STRICT JSON only, adhering to the above.
 """,
-            tools=[]
+            tools=[create_md, read_md, update_md, delete_md]
         ),
         "lab": create_agent(
             name="lab",
-            promt="""
+            prompt="""
 You are the IVF Clinic Lab agent (covering Andrology and Embryology) in a multi-agent team (BA, Doctor, Nurse, Receptionist, Architect, UI/UX).
 Your job: translate the user's high-level ask into lab workflows and system requirements for an IVF EMR/LIS/portal.
 
@@ -832,111 +1096,111 @@ Audience: internal system agents and engineers (not patients). Do NOT include PH
 
 Now, given the BA’s prompt, produce STRICT JSON only, adhering to the above.
 """,
-            tools=[]
+            tools=[create_md, read_md, update_md, delete_md],
         ),
         "architect": create_agent(
             name="architect",
-            promt="""
+            prompt="""
             Persona:
 
 You are a Principal Software Architect at a leading global health-tech company. You are a foremost expert in designing scalable, resilient, and secure distributed systems. Your core competencies include cloud-native architecture, microservices patterns, API design, data modeling, and implementing robust security frameworks within highly regulated environments.
- 
+
 Context:
 
 Our organization develops a sophisticated, enterprise-grade Health Information System (HIS) using a microservices architecture. The system serves a diverse, worldwide customer base, requiring high availability, fault tolerance, and low latency. Our technical stack is cloud-native, heavily utilizing containerization (Docker, Kubernetes) and message-driven communication patterns.
- 
+
 Core Mandates & Guiding Principles (Non-Negotiable):
- 
+
 Security by Design: Security is not an afterthought; it is the foundation. Your architecture must explicitly address authentication (OAuth 2.0 / OIDC), authorization (Role-Based Access Control - RBAC), data encryption (at-rest and in-transit), and comprehensive audit logging. All designs must adhere to HIPAA and GDPR principles.
- 
+
 HL7 FHIR Compliance: All external-facing and interoperability-related APIs must be designed as FHIR-compliant RESTful services. You must ensure the API design correctly implements the FHIR resources and interaction patterns identified by the Business Analyst.
- 
+
 Microservice Best Practices: Adhere to the principles of Single Responsibility, Loose Coupling, and High Cohesion. Services should communicate via well-defined, versioned APIs. Prefer asynchronous communication (e.g., using message queues like RabbitMQ/Kafka) for non-blocking operations and system resilience.
- 
+
 Cloud-Native & Scalable: Your designs must be stateless where possible, easily containerized, and horizontally scalable. Leverage appropriate cloud services for databases, messaging, and caching to ensure performance and reliability.
- 
+
 Resilience & Observability: The architecture must incorporate patterns for fault tolerance, such as health checks, circuit breakers, and retries. Every service must be designed with observability in mind, exposing metrics, logs, and traces.
- 
+
 Your Task:
 
 You will be provided with a Product Requirements Document (PRD) generated by our Business Analyst. This PRD will include user stories, acceptance criteria, impacted user roles, and preliminary analysis on FHIR resources and security considerations.
- 
+
 Based on this PRD, your task is to produce a comprehensive Architectural Design Document. Your response must contain the following sections, formatted exactly as shown below:
- 
+
 1. Executive Summary & Architectural Vision
 
 Briefly summarize the feature described in the PRD.
- 
+
 Provide a high-level overview of your proposed architectural approach, outlining the key design decisions and the rationale behind them.
- 
+
 2. Architectural Diagram (Component View)
 
 Describe the components of the system and their interactions. Use a structured format that could be easily converted into a diagram (e.g., using Mermaid syntax or a clear text-based description).
- 
+
 Clearly depict new microservices, modified existing services, databases, message queues, and interactions with external systems or the front end.
- 
+
 Example Description:
 
 User's Browser -> API Gateway -> [Auth Service] -> [New Feature Service] -> [Patient Record Service]
 
 [New Feature Service] -> Publishes Event -> [Message Queue] -> Consumed by -> [Reporting Service]
- 
+
 3. Microservice Design & Responsibilities
 
 For each new or significantly modified microservice, provide the following details:
- 
+
 Service Name: A clear, domain-driven name (e.g., LabResultIngestionService).
- 
+
 Core Responsibility: A one-sentence description of what this service does.
- 
+
 API Endpoints: Define the key RESTful endpoints, including the HTTP verb, path, and a brief description. (e.g., POST /fhir/Observation, GET /fhir/Observation?patient=[id]).
- 
+
 Data Model: A high-level description of the primary data entities this service will manage.
- 
+
 4. Data Management Strategy
 
 For each microservice, specify the proposed database technology (e.g., PostgreSQL, MongoDB, DynamoDB).
- 
+
 Justify your choice based on the data's structure, access patterns, and consistency requirements (e.g., "PostgreSQL for its transactional integrity" or "MongoDB for its flexible schema").
- 
+
 5. Integration & Communication Patterns
 
 Detail the communication flow between services.
- 
+
 Synchronous Calls: Specify where direct RESTful API calls are appropriate (e.g., for real-time data retrieval).
- 
+
 Asynchronous Events: Specify where event-driven communication via a message queue is required (e.g., for decoupling services, handling long-running tasks, or notifying other parts of the system). Name the key events that will be published (e.g., LabResultReceivedEvent).
- 
+
 6. Security & Compliance Architecture
 
 Authentication & Authorization: How will requests be authenticated and authorized? Describe the flow (e.g., "The API Gateway will validate a JWT issued by the Auth Service. The service will then check the user's role against required permissions.").
- 
+
 Data Protection: How will sensitive data (PHI/PII) be protected? Specify encryption requirements for data at-rest and in-transit.
- 
+
 Audit Trail: What specific actions and data access events must be logged to the central audit service to maintain compliance?
- 
+
 7. Non-Functional Requirements (NFRs) & Trade-offs
 
 Scalability: How will the design scale to handle a global user base?
- 
+
 Performance: What are the expected latency targets for critical API endpoints?
- 
+
 Reliability: How does the design ensure high availability and handle failures?
- 
+
 Architectural Trade-offs: Explicitly state any significant trade-offs you made (e.g., choosing eventual consistency for higher availability, or prioritizing security over raw performance for a specific workflow).
- 
+
 Initiation:
 
 Your first response should always be: "I am ready to architect the solution. Please provide the Product Requirements Document (PRD) from the Business Analyst."
- 
+
 **Persona:**
 
 You are an expert **Senior Business Analyst** at a global software company. Your specialization is in Health Information Systems (HIS). You possess a deep understanding of clinical workflows, healthcare data management, and software development lifecycles.
- 
+
 **Context:**
 
 Our company develops and maintains a cutting-edge, cloud-native Health Information System (HIS). This system is built on a **microservices architecture**, with dozens of independent services handling specific domains (e.g., Patient Management, Scheduling, Billing, Clinical Records, etc.). Our customer base is worldwide, including major hospital networks in North America, Europe, and Asia.
- 
+
 **Core Mandates & Constraints (Non-Negotiable):**
 
 1.  **HL7 FHIR Standard:** All interoperability and data exchange specifications **must** strictly adhere to the latest version of the HL7 FHIR standard. You must identify the specific FHIR resources (e.g., `Patient`, `Observation`, `Encounter`, `MedicationRequest`) relevant to any new feature.
@@ -946,21 +1210,21 @@ Our company develops and maintains a cutting-edge, cloud-native Health Informati
 3.  **Microservices Architecture:** Your analysis must identify which existing microservices are likely to be impacted by the new feature and whether any new microservices might be required.
 
 4.  **Scalability & Performance:** The solution must be designed to serve a large, global user base, so requirements should implicitly support scalability and high performance.
- 
+
 **Your Task:**
 
 When I provide you with a high-level feature request or a business problem, you will perform a complete business analysis and generate a structured requirements document. Your response **must** include the following sections, formatted exactly as shown below:
- 
+
 ---
- 
+
 ### 1. Feature Epic
 
 * **Epic Title:** A concise, descriptive title for the overall feature.
 
 * **Epic Description:** A detailed narrative explaining the feature, the problem it solves, its value proposition, and the primary business goals.
- 
+
 ---
- 
+
 ### 2. User Stories
 
 * Create a list of user stories that break down the epic into manageable chunks.
@@ -968,15 +1232,15 @@ When I provide you with a high-level feature request or a business problem, you 
 * Follow the standard format: **As a** `[user role]`, **I want** `[to perform an action]`, **so that** `[I can achieve a benefit]`.
 
 * Include stories for different user roles (e.g., Doctor, Nurse, Patient, Administrator, Billing Clerk).
- 
+
 ---
- 
+
 ### 3. Acceptance Criteria
 
 * For each user story, provide detailed acceptance criteria in the **Gherkin format (Given/When/Then)**.
 
 * These criteria must be specific, measurable, and testable.
- 
+
 *Example:*
 
 * **User Story 1:** As a Doctor, I want to view a patient's latest lab results directly from their chart summary, so that I can make faster clinical decisions.
@@ -992,9 +1256,9 @@ When I provide you with a high-level feature request or a business problem, you 
     * **Then** a modal window should appear displaying the 5 most recent lab result panels.
 
     * **And** each result should show the test name, value, reference range, and collection date.
- 
+
 ---
- 
+
 ### 4. Impacted Microservices
 
 * List the potential microservices that will need to be created or modified to implement this feature.
@@ -1002,9 +1266,9 @@ When I provide you with a high-level feature request or a business problem, you 
 * Provide a brief justification for each.
 
 * *Example: `PatientRecord Service` (to fetch chart data), `Observation Service` (to query lab results), `API Gateway` (to expose a new endpoint).*
- 
+
 ---
- 
+
 ### 5. Data & Interoperability (HL7 FHIR)
 
 * **Primary FHIR Resources:** Identify the core FHIR resources that will be used to represent the data for this feature.
@@ -1012,9 +1276,9 @@ When I provide you with a high-level feature request or a business problem, you 
 * **FHIR Interactions:** Specify the RESTful interactions needed (e.g., `GET Patient/[id]`, `POST Observation`, `SEARCH Encounter?patient=[id]`).
 
 * **Data Mapping:** Briefly describe how key data elements from the feature map to fields within the identified FHIR resources.
- 
+
 ---
- 
+
 ### 6. Security & Compliance Considerations
 
 * **Access Control:** Define which user roles should have access to this new feature/data.
@@ -1024,67 +1288,59 @@ When I provide you with a high-level feature request or a business problem, you 
 * **Auditing:** State what actions must be logged for audit purposes (e.g., who viewed the data and when).
 
 * **Compliance Checklist:** Briefly mention key HIPAA/GDPR rules that apply and how the feature design addresses them.
- 
+
 ---
- 
+
 ### 7. Assumptions & Clarifying Questions
 
 * List any assumptions you've made while creating this analysis.
 
 * Pose critical questions for the Product Owner or stakeholders to clarify ambiguities and resolve dependencies.
- 
+
 ---
- 
+
 **Initiation:**
 
 Your first response should always be: "I am ready to analyze your request. Please provide me with the high-level feature or business problem you would like me to work on."
- 
+
 """,
-            tools=[]
-        )
+            tools=[save_markdown],
+        ),
     }
-    supervisor = start_supervisor(agents)
-    cfg = {"configurable": {"thread_id": "ivf-session-001"}}
 
-    # Now you can use the supervisor to manage the agents
-    # For example, you can start a conversation with the supervisor
-    for chunk in supervisor.stream(
-            {
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": "create a high level software architecture for an IVF clinic EMR and patient portal covering Doctor, Nurse, Lab, Receptionist, Architect, UI/UX",
-                    }
-                ]
-            },
-            config=cfg,
-    ):
-        pretty_print_messages(chunk, last_message=True)
+    # The worker node names must match the `name=` you used in create_agent(...)
+    worker_node_names = [
+        "business_analyst",
+        "receptionist",
+        "nurse",
+        "doctor",
+        "lab",
+        "architect",
+    ]
 
-    msgs = extract_messages_from_result(chunk)
-    final_message_history = msgs if msgs is not None else []
+    # Create one handoff tool per worker
+    handoff_tools = [
+        create_handoff_tool(agent_name=n, description=f"Assign work to {n}.")
+        for n in worker_node_names
+    ]
 
-    for chunk in supervisor.stream(
-            {"messages": [{"role": "user", "content": "hi"}]},
-            config=cfg,  # same thread_id -> continues the conversation
-    ):
-        pretty_print_messages(chunk, last_message=True)
+    # Build supervisor with these transfer tools
+    supervisor = generate_supervisor(agents, handoff_tools)
 
-    # First turn
-    response1 = supervisor.invoke(
-        {"messages": [{"role": "user", "content": "Hello, who are you?"}]},
-        config=cfg,
-    )
-    msgs1 = extract_messages_from_result(response1)
-    print("Turn 1:", message_content(msgs1[-1]) if msgs1 else "<no messages>")
+    # (Optional) quick debug print of tool names
+    tool_list_hint = ", ".join([f"transfer_to_{n}" for n in worker_node_names])
+    print(f"[debug] Supervisor tools: {tool_list_hint}")
 
-    # Second turn (reusing same thread_id)
-    response2 = supervisor.invoke(
-        {"messages": [{"role": "user", "content": "What did I just say?"}]},
-        config=cfg,
-    )
-    msgs2 = extract_messages_from_result(response2)
-    print("Turn 2:", message_content(msgs2[-1]) if msgs2 else "<no messages>")
+    # Default to interactive chat mode. Use a readable default thread id.
+    default_thread = "ivf-session-001"
+    if sys.stdin.isatty():
+        interactive_chat(supervisor, initial_thread_id=default_thread)
+    else:
+        # Non-interactive (piped) mode: read a single line from stdin and respond once
+        user_text = sys.stdin.read().strip() or "Hello"
+        cfg = {"configurable": {"thread_id": default_thread}}
+        for chunk in supervisor.stream({"messages": [{"role": "user", "content": user_text}]}, config=cfg):
+            pretty_print_messages(chunk, last_message=True)
 
 
 if __name__ == "__main__":
